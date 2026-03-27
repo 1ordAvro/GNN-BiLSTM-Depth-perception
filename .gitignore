@@ -1,3 +1,4 @@
-Data_raw/
 __pycache__/
 *.pt
+.vscode/
+data/
