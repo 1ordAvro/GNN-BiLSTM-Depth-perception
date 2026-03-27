@@ -21,7 +21,7 @@ from scipy.signal import ellip, sosfiltfilt, stft as scipy_stft
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
-WORKBOOK    = Path("../data/raw/trial1.xlsx").resolve()
+WORKBOOK    = Path("../data/raw/trial2.xlsx").resolve()
 SHEET       = "Sheet1"
 
 FS               = 500
