@@ -1,27 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from scipy.stats import f_oneway
-import networkx as nx
-import matplotlib.pyplot as plt
 
 # -------------------------------
 # DEVICE
 # -------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-
-# -------------------------------
-# CHANNELS
-# -------------------------------
-SELECTED_CHANNELS = [
-    "Fp1-A1","Fp2-A2","F3-A1","F4-A2",
-    "C3-A1","C4-A2","P3-A1","P4-A2",
-    "O1-A1","O2-A2","F7-A1","F8-A2",
-    "T3-A1","T4-A2","T5-A1","T6-A2"
-]
-CHANNEL_LABELS = [ch.split('-')[0] for ch in SELECTED_CHANNELS]
 
 # -------------------------------
 # SPECTRAL WEIGHTING
@@ -60,7 +45,7 @@ def sparsify_graph(A, k=3):
     return A_sparse
 
 # -------------------------------
-# GAT (UPDATED FOR BATCH GRAPH)
+# GAT
 # -------------------------------
 class GATLayer(nn.Module):
     def __init__(self, in_features, out_features):
@@ -70,10 +55,7 @@ class GATLayer(nn.Module):
         self.leakyrelu = nn.LeakyReLU(0.2)
 
     def forward(self, H, A):
-        # H: (B, C, F)
-        # A: (B, C, C)
-
-        Wh = self.W(H)  # (B, C, F')
+        Wh = self.W(H)
         B, C, _ = Wh.shape
 
         Wh_i = Wh.unsqueeze(2).repeat(1, 1, C, 1)
@@ -82,7 +64,6 @@ class GATLayer(nn.Module):
         e = torch.cat([Wh_i, Wh_j], dim=-1)
         e = self.leakyrelu(torch.matmul(e, self.a))
 
-        # 🔥 FIXED MASK (BATCH-AWARE)
         mask = (A > 0)
         eye = torch.eye(C, device=A.device).bool().unsqueeze(0)
         mask = mask | eye
@@ -90,12 +71,12 @@ class GATLayer(nn.Module):
         e = e.masked_fill(~mask, -1e9)
 
         alpha = F.softmax(e, dim=-1)
-        alpha = F.dropout(alpha, 0.3, training=self.training)
+        alpha = F.dropout(alpha, 0.1, training=self.training)
 
         return F.relu(torch.matmul(alpha, Wh))
 
 # -------------------------------
-# CHANNEL ATTENTION POOLING
+# CHANNEL ATTENTION
 # -------------------------------
 class ChannelAttentionPooling(nn.Module):
     def __init__(self, F):
@@ -115,7 +96,7 @@ class TemporalAttention(nn.Module):
         super().__init__()
         self.W = nn.Linear(hidden_dim, hidden_dim)
         self.v = nn.Linear(hidden_dim, 1, bias=False)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.1)
         self.temperature = 1.5
 
     def forward(self, x):
@@ -128,7 +109,7 @@ class TemporalAttention(nn.Module):
         alpha = torch.softmax(scores, dim=1)
         context = (x * alpha.unsqueeze(-1)).sum(dim=1)
 
-        return context, alpha
+        return context
 
 # -------------------------------
 # MODEL
@@ -153,26 +134,32 @@ class EEGModel(nn.Module):
 
         self.temporal_attn = TemporalAttention(64)
 
-        self.dropout = nn.Dropout(0.3)
+        self.norm = nn.LayerNorm(64)
 
         self.fc = nn.Sequential(
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(32, num_classes)
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
 
     def forward(self, x):
         x = self.spectral(x)
 
-        # 🔥 PER-SAMPLE GRAPH
         A_list = []
         for i in range(x.shape[0]):
             A_i = compute_graph(x[i])
             A_i = sparsify_graph(A_i)
             A_list.append(A_i)
 
-        A = torch.stack(A_list).to(x.device)  # (B, C, C)
+        A = torch.stack(A_list).to(x.device)
 
         gat_out = []
         for t in range(x.shape[1]):
@@ -183,9 +170,10 @@ class EEGModel(nn.Module):
         x = self.pool(x)
 
         x, _ = self.lstm(x)
-        x = self.dropout(x)
 
-        x, _ = self.temporal_attn(x)
+        x = self.temporal_attn(x)
+
+        x = self.norm(x)
 
         return self.fc(x)
 
@@ -200,7 +188,7 @@ def train_model(model, X_train, y_train, epochs=100, batch_size=16):
         shuffle=True
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
@@ -235,96 +223,6 @@ def evaluate(model, X, y):
     return acc
 
 # -------------------------------
-# EDGE ANALYSIS
-# -------------------------------
-def extract_edge_features(Xw):
-    C = Xw.shape[2]
-    edges_all = []
-
-    for i in range(Xw.shape[0]):
-        A = compute_graph(Xw[i])
-        A = sparsify_graph(A)
-        edges = A.numpy()[np.triu_indices(C, k=1)]
-        edges_all.append(edges)
-
-    return np.array(edges_all)
-
-def analyze_edges(edge_vals, y):
-    C = len(CHANNEL_LABELS)
-    tri_idx = list(zip(*np.triu_indices(C, k=1)))
-
-    results = []
-
-    for i in range(edge_vals.shape[1]):
-        near = edge_vals[y == 0, i]
-        mid  = edge_vals[y == 1, i]
-        far  = edge_vals[y == 2, i]
-
-        if np.std(near) < 1e-6:
-            continue
-
-        _, p = f_oneway(near, mid, far)
-        effect = np.mean(near) - np.mean(far)
-
-        i1, i2 = tri_idx[i]
-
-        results.append({
-            "edge": f"{CHANNEL_LABELS[i1]}–{CHANNEL_LABELS[i2]}",
-            "p": p,
-            "effect": effect
-        })
-
-    results = sorted(results, key=lambda x: x["p"])
-
-    print("\nTop edges:\n")
-    for r in results[:10]:
-        print(f"{r['edge']} | p={r['p']:.4f} | effect={r['effect']:.4f}")
-
-    return results
-
-# -------------------------------
-# GRAPH VISUALIZATION
-# -------------------------------
-def plot_graph(A, title="Graph"):
-    A = A.detach().cpu().numpy()
-    C = A.shape[0]
-
-    G = nx.Graph()
-    for i in range(C):
-        G.add_node(i)
-
-    for i in range(C):
-        for j in range(i + 1, C):
-            if A[i, j] > 0:
-                G.add_edge(i, j, weight=A[i, j])
-
-    pos = nx.spring_layout(G, seed=42)
-    labels = {i: CHANNEL_LABELS[i] for i in range(C)}
-    weights = [G[u][v]['weight'] * 3 for u, v in G.edges()]
-
-    plt.figure(figsize=(6, 6))
-    nx.draw(G, pos, labels=labels,
-            node_size=700, node_color="skyblue",
-            width=weights)
-
-    plt.title(title)
-    plt.show()
-
-def build_class_graph(Xw, y, target_class):
-    graphs = []
-    for i in range(Xw.shape[0]):
-        if y[i] == target_class:
-            A = compute_graph(Xw[i])
-            A = sparsify_graph(A)
-            graphs.append(A)
-    return torch.stack(graphs).mean(0)
-
-def plot_sample_graph(Xw, idx=0):
-    A = compute_graph(Xw[idx])
-    A = sparsify_graph(A)
-    plot_graph(A, f"Sample {idx}")
-
-# -------------------------------
 # MAIN
 # -------------------------------
 def main():
@@ -348,23 +246,6 @@ def main():
     print("\nFINAL RESULTS")
     print(f"Train Acc: {train_acc:.3f}")
     print(f"Test  Acc: {test_acc:.3f}")
-
-    print("\nRunning analysis on TRAIN set...\n")
-
-    with torch.no_grad():
-        Xw = model.spectral(X_train).cpu()
-
-    edge_vals = extract_edge_features(Xw)
-    analyze_edges(edge_vals, y_train.cpu().numpy())
-
-    print("\nPlotting graphs...\n")
-
-    plot_sample_graph(Xw, 0)
-
-    plot_graph(build_class_graph(Xw, y_train.cpu(), 0), "NEAR")
-    plot_graph(build_class_graph(Xw, y_train.cpu(), 1), "MID")
-    plot_graph(build_class_graph(Xw, y_train.cpu(), 2), "FAR")
-
 
 if __name__ == "__main__":
     main()
