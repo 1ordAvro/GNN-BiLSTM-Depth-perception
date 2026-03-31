@@ -365,9 +365,6 @@ def main():
     plot_graph(build_class_graph(Xw, y_train.cpu(), 1), "MID")
     plot_graph(build_class_graph(Xw, y_train.cpu(), 2), "FAR")
 
-    print(torch.unique(y_train, return_counts=True))
-    print(torch.unique(y_test, return_counts=True))
-
 
 if __name__ == "__main__":
     main()
