@@ -1,278 +1,190 @@
-"""
-BrainDepth GNN-BiLSTM — EEG Preprocessing Pipeline (Excel / 500 Hz)
-=====================================================================
-Protocol (500 Hz):
-  fixation cross  : 3s × 500 = 1500 samples  → discard
-  low depth       : 5s × 500 = 2500 samples  → class 0 (Near)
-  mid depth       : 5s × 500 = 2500 samples  → class 1 (Mid)
-  far depth       : 5s × 500 = 2500 samples  → class 2 (Far)
-  one cycle total :            9000 samples
-  85001 rows      → 9 complete cycles → 9 trials × 3 classes per sheet
-
-Pipeline: Load → Bandpass (3–13 Hz, elliptic order-10) → Segment → STFT
-Output  : single HDF5  X[total_trials, 16, F', T_frames]  y[total_trials]
-"""
-
-import gc
-from pathlib import Path
 import numpy as np
-import h5py
-import openpyxl
 import pandas as pd
-from scipy.signal import ellip, sosfiltfilt, stft
-from tqdm import tqdm
+import torch
+from scipy.signal import butter, filtfilt, stft
+from pathlib import Path
+import random
 
-# ─────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────
-WORKBOOK_1  = Path("../data/raw/trial1.xlsx").resolve()
-WORKBOOK_2  = Path("../data/raw/trial2.xlsx").resolve()
-OUTPUT_H5   = Path("../data/processed/braindepth.h5").resolve()
+# ===============================
+# PARAMETERS
+# ===============================
+FS = 500
+LOWCUT = 0.5
+HIGHCUT = 40
+WINDOW = 128
+OVERLAP = 64
+NFFT = 256
 
-FS           = 500
-N_CHANNELS   = 16
-N_CLASSES    = 3
-CLASS_NAMES  = ["Near", "Mid", "Far"]
+CHUNK_SIZE = None
+LABEL_MAP = {"low": 0, "mid": 1, "high": 2}
 
-FIXATION_SAMPLES  = 3 * FS
-STIMULUS_SAMPLES  = 5 * FS
-CYCLE_SAMPLES     = FIXATION_SAMPLES + N_CLASSES * STIMULUS_SAMPLES  # 9000
+TRIAL_DURATION = 18
+TRIAL_LENGTH = TRIAL_DURATION * FS
 
-PLOT_SAMPLES = 2000
+SELECTED_CHANNELS = [
+    "Fp1-A1","Fp2-A2",
+    "F3-A1","F4-A2",
+    "C3-A1","C4-A2",
+    "P3-A1","P4-A2",
+    "O1-A1","O2-A2",
+    "F7-A1","F8-A2",
+    "T3-A1","T4-A2",
+    "T5-A1","T6-A2"
+]
 
-BP_LOW    = 3.0
-BP_HIGH   = 13.0
-BP_ORDER  = 10
-
-STFT_WINDOW   = 1024
-STFT_OVERLAP  = 896
-STFT_HOP      = STFT_WINDOW - STFT_OVERLAP
-
-
-# ─────────────────────────────────────────────────────────
+# ===============================
 # FILTER
-# ─────────────────────────────────────────────────────────
-def _build_sos() -> np.ndarray:
-    return ellip(
-        N=BP_ORDER, rp=0.5, rs=60,
-        Wn=[BP_LOW, BP_HIGH], btype="bandpass", fs=FS, output="sos",
-    )
+# ===============================
+def bandpass_filter(signal):
+    nyq = 0.5 * FS
+    low = LOWCUT / nyq
+    high = HIGHCUT / nyq
+    b, a = butter(4, [low, high], btype='band')
+    return filtfilt(b, a, signal, axis=0)
 
-SOS = _build_sos()
-
-
-def bandpass_filter(eeg: np.ndarray) -> np.ndarray:
-    out = np.empty_like(eeg)
-    for ch in range(eeg.shape[1]):
-        out[:, ch] = sosfiltfilt(SOS, eeg[:, ch])
-    return out
-
-
-# ─────────────────────────────────────────────────────────
+# ===============================
 # STFT
-# ─────────────────────────────────────────────────────────
-_FREQ_MASK = None
+# ===============================
+def compute_stft(segment):
+    C = segment.shape[1]
+    stft_list = []
 
-def compute_stft(window: np.ndarray) -> np.ndarray:
-    global _FREQ_MASK
-    stacks = []
-    for ch in range(window.shape[0]):
-        freqs, _, Zxx = stft(
-            window[ch], fs=FS, window="hann",
-            nperseg=STFT_WINDOW, noverlap=STFT_OVERLAP,
-            boundary="zeros", padded=True,
+    for ch in range(C):
+        f, t, Zxx = stft(
+            segment[:, ch],
+            fs=FS,
+            nperseg=WINDOW,
+            noverlap=OVERLAP,
+            nfft=NFFT
         )
-        if _FREQ_MASK is None:
-            _FREQ_MASK = (freqs >= BP_LOW) & (freqs <= BP_HIGH)
-            print(f"    STFT: F'={_FREQ_MASK.sum()} bins "
-                  f"({freqs[_FREQ_MASK][0]:.2f}–{freqs[_FREQ_MASK][-1]:.2f} Hz)")
-        stacks.append(np.abs(Zxx[_FREQ_MASK, :]).astype(np.float32))
-    return np.stack(stacks, axis=0)
+        stft_list.append(np.abs(Zxx))
 
+    stft_array = np.stack(stft_list, axis=0)
 
-# ─────────────────────────────────────────────────────────
-# LOAD ONE SHEET
-# ─────────────────────────────────────────────────────────
-def load_sheet(workbook_path: Path, sheet_name: str):
-    df = pd.read_excel(
-        workbook_path, sheet_name=sheet_name,
-        header=0, engine="openpyxl",
-    )
-    if df.empty or df.shape[0] < CYCLE_SAMPLES:
-        print(f"    Skipping empty/short sheet '{sheet_name}'")
-        return None
-    eeg = df.iloc[:, :N_CHANNELS].values.astype(np.float32)
-    if eeg.shape[1] != N_CHANNELS:
-        raise ValueError(
-            f"Expected {N_CHANNELS} channels, got {eeg.shape[1]} "
-            f"in {workbook_path.name}:{sheet_name}"
-        )
-    print(f"    Loaded: {eeg.shape[0]} samples x {eeg.shape[1]} channels")
-    return eeg
+    freq_mask = f <= 40
+    stft_array = stft_array[:, freq_mask, :]
 
+    return stft_array
 
-# ─────────────────────────────────────────────────────────
-# SEGMENT + STFT
-# ─────────────────────────────────────────────────────────
-def segment_and_stft(eeg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    n_cycles  = eeg.shape[0] // CYCLE_SAMPLES
-    remainder = eeg.shape[0] % CYCLE_SAMPLES
+# ===============================
+# SEGMENT EXTRACTION
+# ===============================
+def extract_segments(data):
+    start = 3 * FS
 
-    if n_cycles == 0:
-        print("    No complete cycles found.")
-        return np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.int32)
+    low = data[start : start + 5*FS]
+    mid = data[start + 5*FS : start + 10*FS]
+    high = data[start + 10*FS : start + 15*FS]
 
-    print(f"    {n_cycles} cycles → {n_cycles * N_CLASSES} trials "
-          f"({remainder} remainder samples discarded)")
+    return {"low": low, "mid": mid, "high": high}
 
-    X_list, y_list = [], []
-    for cycle in range(n_cycles):
-        base = cycle * CYCLE_SAMPLES + FIXATION_SAMPLES
-        for cls_idx in range(N_CLASSES):
-            start  = base + cls_idx * STIMULUS_SAMPLES
-            end    = start + STIMULUS_SAMPLES
-            window = eeg[start:end, :].T
-            X_list.append(compute_stft(window))
-            y_list.append(cls_idx)
+# ===============================
+# NORMALIZATION
+# ===============================
+def normalize_tensor(x):
+    return (x - x.mean()) / (x.std() + 1e-6)
 
-    return np.stack(X_list, axis=0), np.array(y_list, dtype=np.int32)
+# ===============================
+# LOAD DATA
+# ===============================
+def load_data(filepath):
+    df = pd.read_excel(filepath)
 
+    missing = [ch for ch in SELECTED_CHANNELS if ch not in df.columns]
+    if missing:
+        raise ValueError(f"Missing channels: {missing}")
 
-# ─────────────────────────────────────────────────────────
-# PROCESS ONE SHEET
-# ─────────────────────────────────────────────────────────
-def process_sheet(workbook_path: Path, sheet_name: str):
-    eeg = load_sheet(workbook_path, sheet_name)
-    if eeg is None:
-        return None, None
-    eeg = bandpass_filter(eeg)
-    X, y = segment_and_stft(eeg)
-    del eeg
-    gc.collect()
-    return X, y
+    return df[SELECTED_CHANNELS].values
 
+# ===============================
+# PROCESS FILE (TRIAL-WISE)
+# ===============================
+def process_file(filepath):
+    print(f"\nProcessing: {filepath}")
 
-# ─────────────────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────────────────
-def run_pipeline():
-    OUTPUT_H5.parent.mkdir(parents=True, exist_ok=True)
+    data = load_data(filepath)
+    filtered = bandpass_filter(data)
 
-    all_sheets = []
-    subj_id = 1
-    for wb_path in [WORKBOOK_1, WORKBOOK_2]:
-        if not wb_path.exists():
-            print(f"Workbook not found: {wb_path}, skipping.")
+    trials = []
+    total_samples = data.shape[0]
+
+    trial_count = 0
+
+    for i in range(0, total_samples, TRIAL_LENGTH):
+        trial = filtered[i:i + TRIAL_LENGTH]
+
+        if len(trial) < TRIAL_LENGTH:
             continue
-        wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True)
-        for sname in wb.sheetnames:
-            all_sheets.append((wb_path, sname, subj_id))
-            subj_id += 1
-        wb.close()
 
-    print(f"\nBrainDepth Preprocessing Pipeline")
-    print(f"  Subjects : {len(all_sheets)}")
-    print(f"  Output   : {OUTPUT_H5}\n")
+        trial_count += 1
+        segments = extract_segments(trial)
 
-    with h5py.File(OUTPUT_H5, "w") as hf:
+        trial_data = []
+        trial_labels = []
 
-        cfg = hf.create_group("config")
-        cfg.attrs["fs"]               = FS
-        cfg.attrs["n_channels"]       = N_CHANNELS
-        cfg.attrs["bp_low"]           = BP_LOW
-        cfg.attrs["bp_high"]          = BP_HIGH
-        cfg.attrs["stft_window"]      = STFT_WINDOW
-        cfg.attrs["stft_hop"]         = STFT_HOP
-        cfg.attrs["stimulus_samples"] = STIMULUS_SAMPLES
-        cfg.attrs["class_names"]      = CLASS_NAMES
+        for label, seg in segments.items():
+            stft_data = compute_stft(seg)
 
-        ds_X = ds_y = ds_sid = None
+            x = torch.tensor(stft_data, dtype=torch.float32)
+            x = x.unsqueeze(0).permute(0, 3, 1, 2)  # (1, T, C, F)
+            x = normalize_tensor(x)
 
-        for wb_path, sheet_name, sid in tqdm(all_sheets, desc="Subjects", unit="sheet"):
-            print(f"\nSubject {sid:02d} | {wb_path.name} → '{sheet_name}'")
+            trial_data.append(x)
+            trial_labels.append(LABEL_MAP[label])
 
-            try:
-                X, y = process_sheet(wb_path, sheet_name)
-            except Exception as e:
-                print(f"  ERROR: {e}")
-                continue
+        trials.append((trial_data, trial_labels))
 
-            if X is None or X.ndim < 4 or X.shape[0] == 0:
-                print("  No trials extracted, skipping.")
-                continue
+    print(f"Trials extracted: {trial_count}")
+    return trials
 
-            n_trials = X.shape[0]
+# ===============================
+# FLATTEN
+# ===============================
+def flatten_trials(trials):
+    data, labels = [], []
+    for d, l in trials:
+        data.extend(d)
+        labels.extend(l)
+    return torch.cat(data, dim=0), torch.tensor(labels)
 
-            if ds_X is None:
-                _, n_ch, F_prime, T_frames = X.shape
-                chunk = (1, n_ch, F_prime, T_frames)
-                ds_X = hf.create_dataset(
-                    "X",
-                    shape=(n_trials, n_ch, F_prime, T_frames),
-                    maxshape=(None, n_ch, F_prime, T_frames),
-                    dtype="float32", chunks=chunk,
-                    compression="gzip", compression_opts=4,
-                )
-                ds_y = hf.create_dataset(
-                    "y", shape=(n_trials,), maxshape=(None,),
-                    dtype="int32", chunks=(min(n_trials, 512),),
-                )
-                ds_sid = hf.create_dataset(
-                    "subject_id", shape=(n_trials,), maxshape=(None,),
-                    dtype="int32", chunks=(min(n_trials, 512),),
-                )
-                print(f"  HDF5 created: X(n, {n_ch}, {F_prime}, {T_frames})")
-                write_start = 0
-            else:
-                write_start = ds_X.shape[0]
-                ds_X.resize(write_start + n_trials, axis=0)
-                ds_y.resize(write_start + n_trials, axis=0)
-                ds_sid.resize(write_start + n_trials, axis=0)
-
-            ds_X[write_start : write_start + n_trials]   = X
-            ds_y[write_start : write_start + n_trials]   = y
-            ds_sid[write_start : write_start + n_trials] = sid
-            hf.flush()
-
-            counts = dict(zip(*np.unique(y, return_counts=True)))
-            print(f"  Written: {n_trials} trials | {counts}")
-
-            del X, y
-            gc.collect()
-
-    print("\nPipeline complete.")
-    _print_summary(OUTPUT_H5)
-
-
-# ─────────────────────────────────────────────────────────
-# SUMMARY + INSPECT
-# ─────────────────────────────────────────────────────────
-def _print_summary(h5_path: Path):
-    with h5py.File(h5_path, "r") as hf:
-        if "X" not in hf:
-            print("No data was written to HDF5 — check errors above.")
-            return
-        X   = hf["X"]
-        y   = hf["y"][:]
-        sid = hf["subject_id"][:]
-        print("─" * 50)
-        print(f"Final shape  : X{X.shape}  dtype={X.dtype}")
-        print(f"Subjects     : {np.unique(sid).size}")
-        for lbl, name in enumerate(CLASS_NAMES):
-            print(f"  Class {name:4s} ({lbl}): {(y == lbl).sum()} trials")
-        print(f"Uncompressed : {X.size * 4 / 1e6:.1f} MB")
-        print("─" * 50)
-
-
-def inspect_h5(h5_path: Path = OUTPUT_H5):
-    with h5py.File(h5_path, "r") as hf:
-        for k in hf.keys():
-            if k == "config":
-                print(f"config: {dict(hf['config'].attrs)}")
-            else:
-                d = hf[k]
-                print(f"{k}: shape={d.shape}  dtype={d.dtype}  chunks={d.chunks}")
-
-
+# ===============================
+# MAIN
+# ===============================
 if __name__ == "__main__":
-    run_pipeline()
+
+    RAW_DIR = Path("../data/raw").resolve()
+    SAVE_DIR = Path("../data/processed").resolve()
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    all_trials = []
+
+    for file in RAW_DIR.glob("*.xlsx"):
+        print(f"\nProcessing file: {file.name}")
+        trials = process_file(file)
+        all_trials.extend(trials)
+
+    print(f"\nTotal trials: {len(all_trials)}")
+
+    # 🔥 SHUFFLE TRIALS
+    random.shuffle(all_trials)
+
+    # 🔥 SPLIT
+    split = int(0.8 * len(all_trials))
+    train_trials = all_trials[:split]
+    test_trials  = all_trials[split:]
+
+    # 🔥 FLATTEN AFTER SPLIT
+    X_train, y_train = flatten_trials(train_trials)
+    X_test, y_test   = flatten_trials(test_trials)
+
+    print("\nFINAL DATASET")
+    print("Train:", X_train.shape, y_train.shape)
+    print("Test :", X_test.shape, y_test.shape)
+
+    # SAVE
+    torch.save(X_train, SAVE_DIR / "X_train.pt")
+    torch.save(y_train, SAVE_DIR / "y_train.pt")
+    torch.save(X_test, SAVE_DIR / "X_test.pt")
+    torch.save(y_test, SAVE_DIR / "y_test.pt")
+
+    print("\nSaved TRAIN/TEST datasets correctly!")
