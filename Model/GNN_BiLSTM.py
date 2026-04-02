@@ -76,7 +76,7 @@ class GATLayer(nn.Module):
         return F.relu(torch.matmul(alpha, Wh))
 
 # -------------------------------
-# CHANNEL ATTENTION
+# CHANNEL ATTENTION (USED AFTER)
 # -------------------------------
 class ChannelAttentionPooling(nn.Module):
     def __init__(self, F):
@@ -84,9 +84,10 @@ class ChannelAttentionPooling(nn.Module):
         self.attn = nn.Linear(F, 1)
 
     def forward(self, x):
+        # x: (B, C, F)
         scores = self.attn(x)
-        weights = torch.softmax(scores, dim=2)
-        return (x * weights).sum(dim=2)
+        weights = torch.softmax(scores, dim=1)
+        return (x * weights).sum(dim=1)
 
 # -------------------------------
 # TEMPORAL ATTENTION
@@ -123,8 +124,6 @@ class EEGModel(nn.Module):
         self.gat_out = 32
         self.gat = GATLayer(F, self.gat_out)
 
-        self.pool = ChannelAttentionPooling(self.gat_out)
-
         self.lstm = nn.LSTM(
             input_size=self.gat_out,
             hidden_size=32,
@@ -133,6 +132,9 @@ class EEGModel(nn.Module):
         )
 
         self.temporal_attn = TemporalAttention(64)
+
+        # 🔥 moved here
+        self.channel_pool = ChannelAttentionPooling(64)
 
         self.norm = nn.LayerNorm(64)
 
@@ -153,6 +155,9 @@ class EEGModel(nn.Module):
     def forward(self, x):
         x = self.spectral(x)
 
+        # -----------------------
+        # GRAPH
+        # -----------------------
         A_list = []
         for i in range(x.shape[0]):
             A_i = compute_graph(x[i])
@@ -165,13 +170,22 @@ class EEGModel(nn.Module):
         for t in range(x.shape[1]):
             gat_out.append(self.gat(x[:, t], A))
 
-        x = torch.stack(gat_out, dim=1)
+        x = torch.stack(gat_out, dim=1)   # (B, T, C, F')
 
-        x = self.pool(x)
+        # -----------------------
+        # LSTM PER CHANNEL
+        # -----------------------
+        B, T, C, Fp = x.shape
 
-        x, _ = self.lstm(x)
+        x = x.view(B * C, T, Fp)          # (B*C, T, F')
+        x, _ = self.lstm(x)               # (B*C, T, 64)
 
-        x = self.temporal_attn(x)
+        x = self.temporal_attn(x)         # (B*C, 64)
+
+        x = x.view(B, C, 64)              # (B, C, 64)
+
+        # 🔥 POOL AFTER ATTENTION
+        x = self.channel_pool(x)          # (B, 64)
 
         x = self.norm(x)
 
