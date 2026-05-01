@@ -29,6 +29,10 @@ SELECTED_CHANNELS = [
     "T3-A1","T4-A2","T5-A1","T6-A2"
 ]
 
+N_CHANNELS = len(SELECTED_CHANNELS)
+ICA_N_COMPONENTS = N_CHANNELS - 1
+
+
 # ===============================
 # LOAD DATA
 # ===============================
@@ -47,12 +51,14 @@ def load_data(filepath):
 # ===============================
 def bandpass_filter(signal):
     nyq = 0.5 * FS
-    b, a = butter(4, [LOWCUT/nyq, HIGHCUT/nyq], btype='band')
+    b, a = butter(4, [LOWCUT / nyq, HIGHCUT / nyq], btype='band')
     return filtfilt(b, a, signal, axis=0)
 
 
+# ===============================
+# ICA
+# ===============================
 def apply_ica_mne(signal):
-    # 🔥 NumPy compatibility fix
     if not hasattr(np, "in1d"):
         np.in1d = np.isin
 
@@ -61,52 +67,39 @@ def apply_ica_mne(signal):
 
     raw = mne.io.RawArray(signal.T, info, verbose=False)
 
-    # -------------------------------
-    # 🔥 HIGH-PASS USING SCIPY (NOT MNE)
-    # -------------------------------
     def highpass(sig, cutoff=1.0):
         nyq = 0.5 * FS
         b, a = butter(4, cutoff / nyq, btype='high')
         return filtfilt(b, a, sig, axis=0)
 
-    signal_hp = highpass(signal)   # (samples, channels)
+    signal_hp = highpass(signal)
     raw_for_ica = mne.io.RawArray(signal_hp.T, info, verbose=False)
 
-    # -------------------------------
-    # ICA FIT
-    # -------------------------------
     ica = ICA(
-        n_components=len(ch_names),
+        n_components=ICA_N_COMPONENTS,
         random_state=42,
-        max_iter=300
+        max_iter=500
     )
     ica.fit(raw_for_ica, verbose=False)
 
-    # -------------------------------
-    # ARTIFACT DETECTION
-    # -------------------------------
     sources = ica.get_sources(raw_for_ica).get_data()
 
     variances = np.var(sources, axis=1)
-    kurtosis = np.mean((sources - sources.mean(axis=1, keepdims=True))**4, axis=1)
+    kurtosis  = np.mean(
+        (sources - sources.mean(axis=1, keepdims=True)) ** 4, axis=1
+    )
 
-    var_norm = variances / (variances.max() + 1e-8)
-    kurt_norm = kurtosis / (kurtosis.max() + 1e-8)
+    var_norm  = variances / (variances.max() + 1e-8)
+    kurt_norm = kurtosis  / (kurtosis.max()  + 1e-8)
+    score     = var_norm  + kurt_norm
 
-    score = var_norm + kurt_norm
-
-    threshold = np.percentile(score, 90)
+    threshold      = np.percentile(score, 90)
     bad_components = np.where(score > threshold)[0]
 
-    # 🔥 SAFETY CAP
-    max_remove = max(1, int(0.2 * len(ch_names)))
+    max_remove     = max(1, int(0.2 * ICA_N_COMPONENTS))
     bad_components = bad_components[:max_remove]
+    ica.exclude    = list(bad_components)
 
-    ica.exclude = list(bad_components)
-
-    # -------------------------------
-    # APPLY ICA ON ORIGINAL SIGNAL
-    # -------------------------------
     cleaned_raw = raw.copy()
     ica.apply(cleaned_raw)
 
@@ -119,9 +112,9 @@ def apply_ica_mne(signal):
 def extract_segments(trial):
     start = 3 * FS
     return {
-        "low":  trial[start : start + 5*FS],
-        "mid":  trial[start + 5*FS : start + 10*FS],
-        "high": trial[start + 10*FS : start + 15*FS]
+        "low":  trial[start           : start + 5 * FS],
+        "mid":  trial[start + 5 * FS  : start + 10 * FS],
+        "high": trial[start + 10 * FS : start + 15 * FS],
     }
 
 
@@ -143,8 +136,7 @@ def compute_stft(segment):
         stft_list.append(np.abs(Zxx))
 
     stft_array = np.stack(stft_list, axis=0)
-
-    freq_mask = f <= 40
+    freq_mask  = f <= 40
     stft_array = stft_array[:, freq_mask, :]
 
     return stft_array
@@ -158,24 +150,22 @@ def normalize(x):
 
 
 # ===============================
-# PROCESS FILE (NO AUGMENTATION)
+# PROCESS ONE FILE
 # ===============================
 def process_file(filepath):
-
-    data = load_data(filepath)
+    data     = load_data(filepath)
     filtered = bandpass_filter(data)
     filtered = apply_ica_mne(filtered)
 
     total_samples = filtered.shape[0]
 
-    X_list = []
-    y_list = []
+    X_list        = []
+    y_list        = []
     trial_id_list = []
-
     trial_counter = 0
 
     for i in range(0, total_samples, TRIAL_LENGTH):
-        trial = filtered[i:i + TRIAL_LENGTH]
+        trial = filtered[i : i + TRIAL_LENGTH]
 
         if len(trial) < TRIAL_LENGTH:
             continue
@@ -184,11 +174,10 @@ def process_file(filepath):
         segments = extract_segments(trial)
 
         for label, seg in segments.items():
-
             stft_data = compute_stft(seg)
 
             x = torch.tensor(stft_data, dtype=torch.float32)
-            x = x.unsqueeze(0).permute(0, 3, 1, 2)  # (1, T, C, F)
+            x = x.unsqueeze(0).permute(0, 3, 1, 2)  # (1, 38, 16, 21)
             x = normalize(x)
 
             X_list.append(x)
@@ -202,14 +191,12 @@ def process_file(filepath):
 # TRIAL-WISE SPLIT
 # ===============================
 def trial_wise_split(X, y, trial_ids, train_ratio=0.8):
-
     unique_trials = torch.unique(trial_ids)
 
-    perm = torch.randperm(len(unique_trials))
+    perm          = torch.randperm(len(unique_trials))
     unique_trials = unique_trials[perm]
 
-    split_idx = int(train_ratio * len(unique_trials))
-
+    split_idx    = int(train_ratio * len(unique_trials))
     train_trials = unique_trials[:split_idx]
     test_trials  = unique_trials[split_idx:]
 
@@ -220,100 +207,60 @@ def trial_wise_split(X, y, trial_ids, train_ratio=0.8):
 
 
 # ===============================
-# SAFE AUGMENTATION (TRAIN ONLY)
-# ===============================
-def augment_tensor(x):
-    augmented = []
-
-    # original
-    augmented.append(x)
-
-    # small noise
-    augmented.append(x + torch.randn_like(x) * 0.02)
-
-    # slightly stronger noise
-    augmented.append(x + torch.randn_like(x) * 0.04)
-
-    # mild scaling
-    augmented.append(x * (0.9 + 0.2 * torch.rand(1)))
-
-    # stronger scaling
-    augmented.append(x * (0.8 + 0.4 * torch.rand(1)))
-
-    return augmented
-
-
-# ===============================
 # MAIN
 # ===============================
 if __name__ == "__main__":
 
-    RAW_DIR = Path("../data/raw").resolve()
+    RAW_DIR  = Path("../data/raw").resolve()
     SAVE_DIR = Path("../data/processed").resolve()
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_X = []
-    all_y = []
+    all_X      = []
+    all_y      = []
     all_trials = []
 
-    for file in RAW_DIR.glob("*.xlsx"):
+    trial_offset = 0
+
+    for file in sorted(RAW_DIR.glob("*.xlsx")):
         print(f"Processing {file.name}")
 
         X_list, y_list, trial_list = process_file(file)
 
+        if not X_list:
+            print(f"  ⚠ No valid trials in {file.name}")
+            continue
+
         all_X.extend(X_list)
         all_y.extend(y_list)
-        all_trials.extend(trial_list)
 
-    X = torch.cat(all_X, dim=0)
-    y = torch.tensor(all_y)
+        max_local_id = max(trial_list)
+        all_trials.extend([t + trial_offset for t in trial_list])
+        trial_offset += max_local_id
+
+        print(f"  Trials: {max_local_id}   Samples: {len(X_list)}")
+
+    if not all_X:
+        raise RuntimeError("No data found.")
+
+    X         = torch.cat(all_X, dim=0)
+    y         = torch.tensor(all_y)
     trial_ids = torch.tensor(all_trials)
 
     print("\nFULL DATASET")
-    print("X shape:", X.shape)
-    print("y shape:", y.shape)
-    print("Trials:", len(torch.unique(trial_ids)))
+    print("X shape :", X.shape)
+    print("y shape :", y.shape)
 
-    # ===============================
-    # SPLIT
-    # ===============================
+    # ---- Split ----
     X_train, X_test, y_train, y_test = trial_wise_split(X, y, trial_ids)
 
-    print("\nBefore Augmentation")
+    print("\nFINAL SPLIT")
     print("Train:", X_train.shape)
     print("Test :", X_test.shape)
 
-    # ===============================
-    # 🔥 AUGMENT TRAIN ONLY
-    # ===============================
-    X_train_aug = []
-    y_train_aug = []
-
-    for i in range(len(X_train)):
-        augmented = augment_tensor(X_train[i])
-
-        for aug in augmented:
-            X_train_aug.append(aug.unsqueeze(0))
-            y_train_aug.append(y_train[i])
-
-    X_train = torch.cat(X_train_aug, dim=0)
-    y_train = torch.tensor(y_train_aug)
-
-    # Shuffle train
-    perm = torch.randperm(len(X_train))
-    X_train = X_train[perm]
-    y_train = y_train[perm]
-
-    print("\nAfter Augmentation")
-    print("Train:", X_train.shape)
-    print("Test :", X_test.shape)
-
-    # ===============================
-    # SAVE
-    # ===============================
+    # ---- Save ----
     torch.save(X_train, SAVE_DIR / "X_train.pt")
     torch.save(y_train, SAVE_DIR / "y_train.pt")
-    torch.save(X_test, SAVE_DIR / "X_test.pt")
-    torch.save(y_test, SAVE_DIR / "y_test.pt")
+    torch.save(X_test,  SAVE_DIR / "X_test.pt")
+    torch.save(y_test,  SAVE_DIR / "y_test.pt")
 
-    print("\nSaved clean dataset with correct augmentation!")
+    print("\n✔ Saved clean dataset (NO augmentation)")
